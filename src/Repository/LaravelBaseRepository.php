@@ -23,6 +23,7 @@ class LaravelBaseRepository
     }
 
     public function getCollection(
+        string $query,
         array $filters,
         int $recodesPerPage,
         string $orderBy,
@@ -39,6 +40,7 @@ class LaravelBaseRepository
             );
         }
 
+        $this->applySearch($builder, $query);
         $this->applyFilters($builder, $filters);
         $this->applyOrderBy($builder, $orderBy, $orderDirection);
 
@@ -101,6 +103,39 @@ class LaravelBaseRepository
         return $builder->get();
     }
 
+    private function applySearch(Builder $builder, string $query): void
+    {
+        $model = $this->getModelInstance();
+
+        if($query === '' || !method_exists($model, 'searchableFields')) {
+            return;
+        }
+
+        $searchableFields = $model->searchableFields();
+
+        [$modelFields, $relationFields] = $this->assignFields($builder, array_combine($searchableFields, $searchableFields));
+
+        $this->applyModelSearch($builder, $modelFields, $query);
+        $this->applyRelationSearch($builder, $relationFields, $query);
+    }
+
+    private function applyModelSearch(Builder $builder, array $modelFields, string $query)
+    {
+        foreach ($modelFields as $searchableField) {
+            $builder->orWhere($searchableField, 'like', '%'.$query.'%');
+        }
+    }
+
+    private function applyRelationSearch(Builder $builder, array $relationFields, string $query)
+    {
+        foreach ($relationFields as $searchableField) {
+            [$relationship, $field] = explode('.', $searchableField);
+
+            $builder->orWhereRelation($relationship, $field, 'like', '%'.$query.'%');
+        }
+    }
+
+
     private function applyFilters(Builder $builder, array $filters): void
     {
         if($filters === []) {
@@ -109,11 +144,13 @@ class LaravelBaseRepository
 
         $this->sanitizeFilters($filters);
 
-        [$modelFilters, $relationFilters] = $this->assignFilters($builder, $filters);
+        [$singleFilters, $rangeFilters] = $this->assignFilters($filters);
+        [$modelFilters, $relationFilters] = $this->assignFields($builder, $singleFilters);
+        [$modelRangeFilters, $relationRangeFilters] = $this->assignFields($builder, $rangeFilters);
 
-        $this->applyModelFilters($builder, $modelFilters);
+        $this->applyModelFilters($builder, $modelFilters, $modelRangeFilters);
 
-        $this->applyRelationshipFilters($builder, $relationFilters);
+        $this->applyRelationshipFilters($builder, $relationFilters, $relationRangeFilters);
     }
 
     private function sanitizeFilters(array &$filters): void
@@ -127,7 +164,7 @@ class LaravelBaseRepository
         }, $filters);
     }
 
-    private function assignFilters(Builder $builder, array $filters): array
+    private function assignFields(Builder $builder, array $filters): array
     {
         $model = $builder->getModel();
         $modelFilterKeys = array_intersect(array_keys($filters), $model->getConnection()->getSchemaBuilder()->getColumnListing($model->getTable()));
@@ -140,28 +177,58 @@ class LaravelBaseRepository
         return [$modelFilters, $relationFilters];
     }
 
-    private function applyModelFilters(Builder $builder, array $modelFilters): void
+    private function assignFilters(array $filters): array
+    {
+        $singleFilters = [];
+        $rangeFilters = [];
+
+        array_walk($filters, function ($filter, $key) use (&$singleFilters, &$rangeFilters) {
+            if(str_starts_with($key, 'range.')) {
+                $rangeFilters[substr($key, strlen('range.'))] = $filter;
+            } else {
+                $singleFilters[$key] = $filter;
+            }
+        });
+
+        return [$singleFilters, $rangeFilters];
+    }
+
+    private function applyModelFilters(Builder $builder, array $modelFilters, array $rangeModelFilters): void
     {
         foreach ($modelFilters as $attribute => $value) {
             $builder->where($attribute, $value);
         }
+        foreach ($rangeModelFilters as $attribute => $value) {
+            $builder->whereBetween($attribute, explode('$', $value));
+        }
     }
 
-    private function applyRelationshipFilters(Builder $builder, array $relationFilters): void
+    private function applyRelationshipFilters(Builder $builder, array $relationFilters, $rangeRelationFilters): void
     {
-        if($relationFilters === []) {
+        if($relationFilters === [] && $rangeRelationFilters === []) {
             return;
         }
 
-        $relationship = explode('.', array_keys($relationFilters)[0])[0];
+        $relationship = $relationFilters !== [] ?  $this->extractRelationshipFromRelationFilters($relationFilters) :
+            $this->extractRelationshipFromRelationFilters($rangeRelationFilters);
 
-        $builder->whereHas($relationship, function (Builder $builder) use($relationFilters) {
+        $builder->whereHas($relationship, function (Builder $builder) use($relationFilters, $rangeRelationFilters) {
             foreach ($relationFilters as $key => $value) {
                 $attribute = explode('.', $key)[1];
 
                 $builder->where($attribute, $value);
             }
+            foreach ($rangeRelationFilters as $key => $value) {
+                $attribute = explode('.', $key)[1];
+
+                $builder->whereBetween($attribute, explode('$', $value));
+            }
         });
+    }
+
+    private function extractRelationshipFromRelationFilters(array $relationFilters): string
+    {
+        return explode('.', array_keys($relationFilters)[0])[0];
     }
 
     private function applyOrderBy(Builder $builder, string $orderBy, string $orderDirection): void
